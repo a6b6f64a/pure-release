@@ -17,13 +17,11 @@ grep -Eq '^[[:space:]]*verus![[:space:]]*\{' "$theorems" || {
 }
 
 for theorem in \
-    a_changed_component_is_never_current_and_a_regression_is_refused \
-    delivery_leaves_no_outgoing_part_without_a_releasing_application \
+    a_changed_component_is_never_up_to_date_and_a_regression_is_refused \
+    planning_strands_nothing_and_forces_only_what_carries_something_outgoing \
     one_bump_leaves_nothing_to_bump_and_publish_then_accepts_everything_ready \
-    a_named_bump_brings_the_application_of_each_part \
-    publish_releases_only_what_is_ready_with_its_carrier_and_parts_first \
-    the_desktop_floor_covers_every_later_release_and_is_the_oldest_that_does \
-    successor_matches_checked_ordered_increment_for_all_u64_pairs
+    a_named_bump_brings_everything_its_components_ship_inside \
+    publish_releases_only_what_is_ready_with_what_carries_it_and_inner_first
 do
     if ! grep -Eq "^[[:space:]]*(pub[[:space:]]+)?(proof[[:space:]]+)?fn[[:space:]]+$theorem([<(]|[[:space:]])" "$theorems"; then
         printf '%s\n' "error: missing executable theorem function: $theorem" >&2

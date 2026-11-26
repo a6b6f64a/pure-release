@@ -2,162 +2,185 @@
 //! here adds to what has to be trusted.
 
 use vstd::prelude::*;
-use vstd::seq_lib::lemma_seq_contains_after_push;
-use vstd::set_lib::{lemma_int_range, lemma_len_subset, set_int_range};
 
 use super::spec::{
-    asked, before, carries_asked_below, forces, forcing_below, in_release_order, is_part_of,
-    rank_of, valid_table,
+    asked, edge_ok, listed_below, named_below, outer_of, pulled_below, ships_inside, valid_layout,
+    wanted,
 };
-use super::{Link, State};
+use super::{Component, State};
 
 verus! {
 
-pub proof fn lemma_forcing_step(
-    table: Seq<Link>,
-    states: Seq<State>,
-    behind: Seq<bool>,
-    app: int,
-    bound: int,
-)
-    ensures
-        forcing_below(table, states, behind, app, bound + 1) <==> forcing_below(
-            table,
-            states,
-            behind,
-            app,
-            bound,
-        ) || forces(table, states, behind, bound, app),
-{
-    if forcing_below(table, states, behind, app, bound + 1) {
-        let part = choose|part: int| part < bound + 1 && forces(table, states, behind, part, app);
-        if part < bound {
-            assert(forcing_below(table, states, behind, app, bound));
-        }
-    }
-    if forcing_below(table, states, behind, app, bound) {
-        let part = choose|part: int| part < bound && forces(table, states, behind, part, app);
-        assert(part < bound + 1 && forces(table, states, behind, part, app));
-    }
-    if forces(table, states, behind, bound, app) {
-        assert(forcing_below(table, states, behind, app, bound + 1));
-    }
-}
-
-pub proof fn lemma_carrying_step(
-    table: Seq<Link>,
-    states: Seq<State>,
-    named: Option<Seq<bool>>,
-    app: int,
-    bound: int,
-)
+pub proof fn lemma_named_step(names: Seq<usize>, name: int, bound: int)
     requires
         bound >= 0,
     ensures
-        carries_asked_below(table, states, named, app, bound + 1) <==> carries_asked_below(
-            table,
-            states,
-            named,
-            app,
-            bound,
-        ) || (is_part_of(table, bound, app) && asked(table, states, named, bound)),
+        named_below(names, name, bound + 1) <==> named_below(names, name, bound) || names[bound] == name,
 {
-    if carries_asked_below(table, states, named, app, bound + 1) {
-        let part = choose|part: int|
-            0 <= part < bound + 1 && is_part_of(table, part, app) && asked(table, states, named, part);
-        if part < bound {
-            assert(carries_asked_below(table, states, named, app, bound));
+    if named_below(names, name, bound + 1) {
+        let k = choose|k: int| 0 <= k < bound + 1 && #[trigger] names[k] == name;
+        if k < bound {
+            assert(named_below(names, name, bound));
         }
     }
-    if carries_asked_below(table, states, named, app, bound) {
-        let part = choose|part: int|
-            0 <= part < bound && is_part_of(table, part, app) && asked(table, states, named, part);
-        assert(0 <= part < bound + 1 && is_part_of(table, part, app));
+    if named_below(names, name, bound) {
+        let k = choose|k: int| 0 <= k < bound && #[trigger] names[k] == name;
+        assert(0 <= k < bound + 1 && names[k] == name);
     }
-    if is_part_of(table, bound, app) && asked(table, states, named, bound) {
-        assert(carries_asked_below(table, states, named, app, bound + 1));
+    if names[bound] == name {
+        assert(named_below(names, name, bound + 1));
     }
 }
 
-/// Only applications carry parts in a valid table.
-pub proof fn lemma_parts_carry_nothing(
-    table: Seq<Link>,
+pub proof fn lemma_listed_step(layout: Seq<Component>, inner: int, outer: int, bound: int)
+    requires
+        bound >= 0,
+    ensures
+        listed_below(layout, inner, outer, bound + 1) <==> listed_below(layout, inner, outer, bound)
+            || outer_of(layout, inner, bound) == outer,
+{
+    if listed_below(layout, inner, outer, bound + 1) {
+        let k = choose|k: int| 0 <= k < bound + 1 && #[trigger] outer_of(layout, inner, k) == outer;
+        if k < bound {
+            assert(listed_below(layout, inner, outer, bound));
+        }
+    }
+    if listed_below(layout, inner, outer, bound) {
+        let k = choose|k: int| 0 <= k < bound && #[trigger] outer_of(layout, inner, k) == outer;
+        assert(0 <= k < bound + 1 && outer_of(layout, inner, k) == outer);
+    }
+    if outer_of(layout, inner, bound) == outer {
+        assert(listed_below(layout, inner, outer, bound + 1));
+    }
+}
+
+/// A component is listed before whatever it ships inside, and that is never
+/// manual.
+pub proof fn lemma_inner_first(layout: Seq<Component>, inner: int, outer: int)
+    requires
+        valid_layout(layout),
+        ships_inside(layout, inner, outer),
+    ensures
+        0 <= inner < outer < layout.len(),
+        !layout[outer].manual,
+{
+    let k = choose|k: int|
+        0 <= k < layout[inner].inside@.len() && #[trigger] outer_of(layout, inner, k) == outer;
+    assert(edge_ok(layout, inner, k));
+}
+
+pub proof fn lemma_wanted_unfolds(
+    layout: Seq<Component>,
+    states: Seq<State>,
+    named: Option<Seq<bool>>,
+    i: int,
+)
+    ensures
+        wanted(layout, states, named, i) <==> asked(layout, states, named, i) || pulled_below(
+            layout,
+            states,
+            named,
+            i,
+            i,
+        ),
+{
+}
+
+pub proof fn lemma_pulled_step(
+    layout: Seq<Component>,
     states: Seq<State>,
     named: Option<Seq<bool>>,
     i: int,
     bound: int,
 )
     requires
-        valid_table(table),
-        bound <= table.len(),
-        !(table[i].kind is App),
+        bound >= 0,
     ensures
-        !carries_asked_below(table, states, named, i, bound),
+        pulled_below(layout, states, named, i, bound + 1) <==> pulled_below(layout, states, named, i, bound)
+            || (ships_inside(layout, bound, i) && wanted(layout, states, named, bound)),
 {
-    if carries_asked_below(table, states, named, i, bound) {
-        let part = choose|part: int|
-            0 <= part < bound && is_part_of(table, part, i) && asked(table, states, named, part);
-        assert(table[part].kind is Part);
+    if pulled_below(layout, states, named, i, bound + 1) {
+        let p = choose|p: int|
+            0 <= p < bound + 1 && #[trigger] ships_inside(layout, p, i) && wanted(layout, states, named, p);
+        if p < bound {
+            assert(pulled_below(layout, states, named, i, bound));
+        }
+    }
+    if pulled_below(layout, states, named, i, bound) {
+        let p = choose|p: int|
+            0 <= p < bound && #[trigger] ships_inside(layout, p, i) && wanted(layout, states, named, p);
+        assert(0 <= p < bound + 1 && ships_inside(layout, p, i));
+    }
+    if ships_inside(layout, bound, i) && wanted(layout, states, named, bound) {
+        assert(pulled_below(layout, states, named, i, bound + 1));
     }
 }
 
-
-/// Appending the next component of the current wave keeps the release order,
-/// and there is still room for it.
-pub proof fn lemma_release_next(table: Seq<Link>, released: Seq<usize>, next: usize, wave: int)
+/// Only earlier components ship inside `i`, so looking past `i` finds nothing
+/// more.
+pub proof fn lemma_pulled_saturates(
+    layout: Seq<Component>,
+    states: Seq<State>,
+    named: Option<Seq<bool>>,
+    i: int,
+    bound: int,
+)
     requires
-        next < table.len(),
-        rank_of(table[next as int].kind) == wave,
-        in_release_order(table, released),
-        forall|p: int| 0 <= p < released.len() ==> #[trigger] released[p] < table.len(),
-        forall|p: int|
-            0 <= p < released.len() ==> {
-                let at = #[trigger] released[p] as int;
-                rank_of(table[at].kind) < wave || (rank_of(table[at].kind) == wave && at < next)
-            },
+        valid_layout(layout),
+        i <= bound,
     ensures
-        released.len() < table.len(),
-        in_release_order(table, released.push(next)),
-        forall|value: usize|
-            #[trigger] released.push(next).contains(value) <==> released.contains(value) || value == next,
+        pulled_below(layout, states, named, i, bound) <==> pulled_below(layout, states, named, i, i),
 {
-    let grown = released.push(next);
-    assert forall|p: int, q: int| 0 <= p < q < grown.len() implies before(
-        table,
-        #[trigger] grown[p] as int,
-        #[trigger] grown[q] as int,
-    ) by {
-        if q < released.len() {
-            assert(before(table, released[p] as int, released[q] as int));
-        } else {
-            assert(grown[p] == released[p]);
-        }
+    if pulled_below(layout, states, named, i, bound) {
+        let p = choose|p: int|
+            0 <= p < bound && #[trigger] ships_inside(layout, p, i) && wanted(layout, states, named, p);
+        lemma_inner_first(layout, p, i);
+        assert(pulled_below(layout, states, named, i, i));
     }
-    let values = grown.map_values(|value: usize| value as int);
-    assert forall|a: int, b: int| 0 <= a < values.len() && 0 <= b < values.len() && a != b implies values[a]
-        != values[b] by {
-        if a < b {
-            assert(before(table, grown[a] as int, grown[b] as int));
-        } else {
-            assert(before(table, grown[b] as int, grown[a] as int));
-        }
+    if pulled_below(layout, states, named, i, i) {
+        let p = choose|p: int|
+            0 <= p < i && #[trigger] ships_inside(layout, p, i) && wanted(layout, states, named, p);
+        assert(0 <= p < bound && ships_inside(layout, p, i));
     }
-    assert forall|k: int| 0 <= k < values.len() implies 0 <= #[trigger] values[k] < table.len() by {
-        if k < released.len() {
-            assert(grown[k] == released[k]);
-        }
+}
+
+/// When a bump is asked for nothing, it reaches nothing.
+pub proof fn lemma_nothing_asked_nothing_wanted(
+    layout: Seq<Component>,
+    states: Seq<State>,
+    named: Option<Seq<bool>>,
+    i: int,
+)
+    requires
+        0 <= i,
+        forall|j: int| 0 <= j <= i ==> !asked(layout, states, named, j),
+    ensures
+        !wanted(layout, states, named, i),
+    decreases i,
+{
+    if wanted(layout, states, named, i) {
+        let p = choose|p: int|
+            0 <= p < i && #[trigger] ships_inside(layout, p, i) && wanted(layout, states, named, p);
+        lemma_nothing_asked_nothing_wanted(layout, states, named, p);
     }
-    values.unique_seq_to_set();
-    lemma_int_range(0, table.len() as int);
-    let indices = set_int_range(0, table.len() as int);
-    assert(values.to_set().subset_of(indices)) by {
-        assert forall|value: int| values.to_set().contains(value) implies indices.contains(value) by {
-            let k = choose|k: int| 0 <= k < values.len() && values[k] == value;
-            assert(0 <= values[k] < table.len());
-        }
-    }
-    lemma_len_subset(values.to_set(), indices);
-    broadcast use lemma_seq_contains_after_push;
+}
+
+/// Whatever a bump reaches, it also reaches everything that ships it.
+pub proof fn lemma_wanted_spreads(
+    layout: Seq<Component>,
+    states: Seq<State>,
+    named: Option<Seq<bool>>,
+    inner: int,
+    outer: int,
+)
+    requires
+        valid_layout(layout),
+        ships_inside(layout, inner, outer),
+        wanted(layout, states, named, inner),
+    ensures
+        wanted(layout, states, named, outer),
+{
+    lemma_inner_first(layout, inner, outer);
 }
 
 }

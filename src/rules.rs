@@ -1,6 +1,7 @@
-//! Release planning over validated fixed-size component tables.
+//! Release planning over a validated layout of components.
 
 use core::cmp::Ordering;
+use core::fmt;
 
 #[cfg(verus_only)]
 use vstd::prelude::*;
@@ -12,14 +13,21 @@ mod spec;
 #[cfg(verus_only)]
 mod theorems;
 
+#[cfg(kani)]
+mod bounded;
+#[cfg(test)]
+mod tests;
+
 #[cfg(verus_only)]
 use lemmas::{
-    lemma_carrying_step, lemma_forcing_step, lemma_parts_carry_nothing, lemma_release_next,
+    lemma_listed_step, lemma_named_step, lemma_pulled_saturates, lemma_pulled_step,
+    lemma_wanted_unfolds,
 };
 #[cfg(verus_only)]
 use spec::{
-    asked, at_least_spec, bumped, carries_asked_below, covers, forced, forces, forcing_below,
-    in_release_order, is_part_of, names, no_carrier, not_ready, rank_of, releases, valid_table,
+    asked, bump_mask, chosen, chosen_mask, edge_ok, listed_below, lists, named_below, names_mask,
+    not_ready, outer_of, outgoing, own_state, planned, pulled_below, settled, ships_inside,
+    stranded, valid_layout, wanted,
 };
 
 /// Verus proof blocks are erased from ordinary builds.
@@ -34,249 +42,483 @@ macro_rules! proof_decl {
     ($($tokens:tt)*) => {};
 }
 
-/// Component table size covered by the exhaustive Kani harnesses. The Verus
-/// proofs hold for every size.
-pub const COMPONENT_COUNT: usize = 11;
+/// One thing you version and release. Its position in the table given to
+/// [`Layout::new`] is its identity everywhere else.
+#[cfg_attr(verus_only, verus_verify)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Component<'a> {
+    /// Table positions of the components this one ships inside. Users only
+    /// receive it through a release of each of them.
+    pub inside: &'a [usize],
+    /// Bumped only when named, never just because it changed.
+    pub manual: bool,
+}
+
+impl<'a> Component<'a> {
+    /// Reaches users through its own releases.
+    pub const fn standalone() -> Self {
+        Self {
+            inside: &[],
+            manual: false,
+        }
+    }
+
+    /// Reaches users only inside releases of the components at `inside`.
+    pub const fn ships_inside(inside: &'a [usize]) -> Self {
+        Self {
+            inside,
+            manual: false,
+        }
+    }
+
+    /// Bumped only when named.
+    pub const fn manual(self) -> Self {
+        Self {
+            inside: self.inside,
+            manual: true,
+        }
+    }
+}
+
+/// What the caller observed about one component.
+#[cfg_attr(verus_only, verus_verify)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fact {
+    /// No release exists.
+    Unreleased,
+    Released {
+        /// The source version compared with the newest released version.
+        source: Ordering,
+        /// A release made now would differ from the newest one. That includes
+        /// a newest release that bundled an older copy of something inside it.
+        changed: bool,
+    },
+}
 
 #[cfg_attr(verus_only, verus_verify, derive(Structural))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum State {
     /// Released as it is.
-    Current,
-    /// Changed since its tag under the tag's version.
+    UpToDate,
+    /// Differs from its newest release under that release's version.
     NeedsBump,
-    /// The source is ahead of the newest tag, or was never released.
+    /// Ahead of its newest release, or never released.
     Ready,
 }
 
-/// The source version is below one already released.
-#[cfg_attr(verus_only, verus_verify, derive(Structural))]
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures
+        result == own_state(fact),
+))]
+fn own(fact: Fact) -> Option<State> {
+    match fact {
+        Fact::Unreleased => Some(State::Ready),
+        Fact::Released { source, changed } => match source {
+            Ordering::Less => None,
+            Ordering::Greater => Some(State::Ready),
+            Ordering::Equal => Some(if changed {
+                State::NeedsBump
+            } else {
+                State::UpToDate
+            }),
+        },
+    }
+}
+
+/// Why a table is not a layout. `component` ships inside `inside`.
+#[cfg_attr(verus_only, verus_verify)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Regressed;
-
-/// `ahead` orders the source version against the newest tag's, and is `None`
-/// for a component that has no tag.
-#[cfg_attr(verus_only, verus_spec(result =>
-    ensures
-        result is Err <==> ahead == Some(Ordering::Less),
-        ahead is None || ahead == Some(Ordering::Greater) ==> result == Ok::<State, Regressed>(State::Ready),
-        ahead == Some(Ordering::Equal) && changed ==> result == Ok::<State, Regressed>(State::NeedsBump),
-        ahead == Some(Ordering::Equal) && !changed ==> result == Ok::<State, Regressed>(State::Current),
-))]
-pub fn state(ahead: Option<Ordering>, changed: bool) -> Result<State, Regressed> {
-    match ahead {
-        None | Some(Ordering::Greater) => Ok(State::Ready),
-        Some(Ordering::Less) => Err(Regressed),
-        Some(Ordering::Equal) if changed => Ok(State::NeedsBump),
-        Some(Ordering::Equal) => Ok(State::Current),
-    }
+pub enum Invalid {
+    /// `inside` is not a table position.
+    Unknown { component: usize, inside: usize },
+    /// `inside` is not listed after `component`. Listing every component before
+    /// what it ships inside rules out cycles and fixes the publish order.
+    OutOfOrder { component: usize, inside: usize },
+    /// `inside` is manual, so it could stay behind while `component` goes out.
+    ManualOuter { component: usize, inside: usize },
 }
 
-#[cfg_attr(verus_only, verus_verify, derive(Structural))]
+/// The source version of `component` is below one already released.
+#[cfg_attr(verus_only, verus_verify)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
-pub enum Kind {
-    /// A net core or bootloader. Units receive it through the manifest entries
-    /// of the application at this table index.
-    Part {
-        app: usize,
-    },
-    App,
-    Other,
+pub struct Regressed {
+    pub component: usize,
 }
 
-#[cfg_attr(verus_only, verus_verify, derive(Structural))]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
-pub struct Link {
-    pub kind: Kind,
-    /// Bumped only by name.
-    pub manual: bool,
-}
-
-/// Every part names an application, and no application is bumped by name only:
-/// it could then stay behind a part it has to deliver. Every other function
-/// here requires a valid table.
-#[cfg_attr(verus_only, verifier::loop_isolation(false))]
-#[cfg_attr(verus_only, verus_spec(result =>
-    ensures
-        result == valid_table(table@),
-))]
-pub fn valid<const N: usize>(table: &[Link; N]) -> bool {
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            forall|j: int| 0 <= j < i ==> match (#[trigger] table@[j]).kind {
-                Kind::Part { app } => app < N && table@[app as int].kind is App,
-                Kind::App => !table@[j].manual,
-                Kind::Other => true,
-            },
-    ))]
-    for i in 0..N {
-        match table[i].kind {
-            Kind::Part { app } => {
-                if app >= N || table[app].kind != Kind::App {
-                    return false;
-                }
-            }
-            Kind::App => {
-                if table[i].manual {
-                    return false;
-                }
-            }
-            Kind::Other => {}
-        }
-    }
-    true
-}
-
-/// A unit only receives a part through an application entry that carries it, so
-/// a part on its way out makes its application release too. `behind[i]` says
-/// part `i`'s counter is above the one its application's newest entry carries.
-/// Returns, for each application made to release, the part that forces it.
-#[cfg_attr(verus_only, verifier::loop_isolation(false))]
-#[cfg_attr(verus_only, verus_spec(result =>
-    requires
-        valid_table(table@),
-    ensures
-        forall|app: int| 0 <= app < N ==> #[trigger] final(states)@[app] == (
-            if forced(table@, old(states)@, behind@, app) { State::NeedsBump } else { old(states)@[app] }),
-        forall|app: int| 0 <= app < N ==> (
-            #[trigger] result@[app] is Some <==> forced(table@, old(states)@, behind@, app)),
-        forall|app: int| 0 <= app < N ==> (#[trigger] result@[app] matches Some(part) ==>
-            forces(table@, old(states)@, behind@, part as int, app)
-            && !forcing_below(table@, old(states)@, behind@, app, part as int)),
-))]
-pub fn deliver<const N: usize>(
-    table: &[Link; N],
-    states: &mut [State; N],
-    behind: &[bool; N],
-) -> [Option<usize>; N] {
-    let mut forced: [Option<usize>; N] = [None; N];
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            valid_table(table@),
-            forall|k: int| 0 <= k < N && !(table@[k].kind is App) ==> #[trigger] states@[k] == old(states)@[k],
-            forall|app: int| 0 <= app < N ==> #[trigger] states@[app] == (
-                if old(states)@[app] is Current && forcing_below(table@, old(states)@, behind@, app, i as int) {
-                    State::NeedsBump
-                } else {
-                    old(states)@[app]
-                }),
-            forall|app: int| 0 <= app < N ==> (#[trigger] forced@[app] is Some <==>
-                old(states)@[app] is Current && forcing_below(table@, old(states)@, behind@, app, i as int)),
-            forall|app: int| 0 <= app < N ==> (#[trigger] forced@[app] matches Some(part) ==>
-                part < i
-                && forces(table@, old(states)@, behind@, part as int, app)
-                && !forcing_below(table@, old(states)@, behind@, app, part as int)),
-    ))]
-    for i in 0..N {
-        proof! {
-            assert forall|app: int| 0 <= app < N implies
-                #[trigger] forcing_below(table@, old(states)@, behind@, app, i + 1)
-                    == (forcing_below(table@, old(states)@, behind@, app, i as int)
-                        || forces(table@, old(states)@, behind@, i as int, app)) by {
-                lemma_forcing_step(table@, old(states)@, behind@, app, i as int);
-            }
-        }
-        let Kind::Part { app } = table[i].kind else {
-            continue;
-        };
-        let on_its_way = match states[i] {
-            State::Ready => true,
-            State::NeedsBump => !table[i].manual,
-            State::Current => false,
-        };
-        if (on_its_way || behind[i]) && states[app] == State::Current {
-            states[app] = State::NeedsBump;
-            forced[app] = Some(i);
-        }
-    }
-    forced
-}
-
-/// The components `bump` raises: the `named` ones, or without names every
-/// changed one that is not bumped by name only; plus the application of each
-/// part among them. A component already ahead of its tag is never raised again.
-#[cfg_attr(verus_only, verifier::loop_isolation(false))]
-#[cfg_attr(verus_only, verus_spec(result =>
-    requires
-        valid_table(table@),
-    ensures
-        forall|i: int| 0 <= i < N ==> #[trigger] result@[i] == bumped(table@, states@, names(named), i),
-))]
-pub fn bump_set<const N: usize>(
-    table: &[Link; N],
-    states: &[State; N],
-    named: Option<&[bool; N]>,
-) -> [bool; N] {
-    let mut wanted = [false; N];
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            forall|j: int| 0 <= j < i ==> #[trigger] wanted@[j] == asked(table@, states@, names(named), j),
-    ))]
-    for i in 0..N {
-        wanted[i] = match named {
-            Some(named) => named[i],
-            None => states[i] == State::NeedsBump && !table[i].manual,
-        };
-    }
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            valid_table(table@),
-            forall|j: int| 0 <= j < N ==> #[trigger] wanted@[j] == (
-                asked(table@, states@, names(named), j)
-                || carries_asked_below(table@, states@, names(named), j, i as int)),
-    ))]
-    for i in 0..N {
-        proof! {
-            assert forall|app: int| 0 <= app < N implies
-                #[trigger] carries_asked_below(table@, states@, names(named), app, i + 1)
-                    == (carries_asked_below(table@, states@, names(named), app, i as int)
-                        || (is_part_of(table@, i as int, app) && asked(table@, states@, names(named), i as int))) by {
-                lemma_carrying_step(table@, states@, names(named), app, i as int);
-            }
-            if !(table@[i as int].kind is App) {
-                lemma_parts_carry_nothing(table@, states@, names(named), i as int, i as int);
-            }
-        }
-        let kind = table[i].kind;
-        match kind {
-            Kind::Part { app } if wanted[i] => wanted[app] = true,
-            _ => {}
-        }
-    }
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            forall|j: int| 0 <= j < i ==> #[trigger] wanted@[j] == bumped(table@, states@, names(named), j),
-            forall|j: int| i <= j < N ==> #[trigger] wanted@[j] == (
-                asked(table@, states@, names(named), j)
-                || carries_asked_below(table@, states@, names(named), j, N as int)),
-    ))]
-    for i in 0..N {
-        if states[i] == State::Ready {
-            wanted[i] = false;
-        }
-    }
-    wanted
-}
-
-#[cfg_attr(verus_only, verus_verify, derive(Structural))]
+/// Why nothing is published.
+#[cfg_attr(verus_only, verus_verify)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {
-    /// The named component is not ahead of its tag.
-    NotReady(usize),
-    /// No release of `app` is on its way to deliver `part`, so no unit would
-    /// ever be offered it.
-    NoCarrier { part: usize, app: usize },
+    /// The named component is not ahead of its newest release.
+    NotReady { component: usize },
+    /// No release of `inside` is on its way, so nobody would receive
+    /// `component`.
+    Stranded { component: usize, inside: usize },
 }
 
-/// Table indices in the order `publish` releases them.
+/// A validated table: every component is listed before what it ships inside,
+/// and nothing ships inside a manual component.
+#[cfg_attr(verus_only, verus_verify)]
+#[derive(Clone, Copy, Debug)]
+pub struct Layout<'a, const N: usize> {
+    components: [Component<'a>; N],
+}
+
+/// The state of every component once each release that has to carry another is
+/// accounted for.
+#[cfg_attr(verus_only, verus_verify)]
+#[derive(Clone, Copy, Debug)]
+pub struct Plan<'a, const N: usize> {
+    components: [Component<'a>; N],
+    states: [State; N],
+    forced: [Option<usize>; N],
+}
+
+/// Table positions in table order.
 #[cfg_attr(verus_only, verus_verify)]
 #[derive(Clone, Copy, Debug)]
 pub struct Order<const N: usize> {
     items: [usize; N],
     len: usize,
+}
+
+#[cfg(verus_only)]
+verus! {
+
+impl<'a, const N: usize> Layout<'a, N> {
+    #[verifier::type_invariant]
+    pub closed spec fn well_formed(self) -> bool {
+        valid_layout(self.components@)
+    }
+
+    /// The table this layout was built from.
+    pub closed spec fn view(self) -> Seq<Component<'a>> {
+        self.components@
+    }
+}
+
+impl<'a, const N: usize> Plan<'a, N> {
+    #[verifier::type_invariant]
+    pub closed spec fn well_formed(self) -> bool {
+        valid_layout(self.components@) && settled(self.components@, self.states@)
+    }
+
+    pub closed spec fn layout(self) -> Seq<Component<'a>> {
+        self.components@
+    }
+
+    pub closed spec fn states_view(self) -> Seq<State> {
+        self.states@
+    }
+
+    pub closed spec fn reasons(self) -> Seq<Option<usize>> {
+        self.forced@
+    }
+}
+
+impl<const N: usize> Order<N> {
+    #[verifier::type_invariant]
+    pub closed spec fn well_formed(self) -> bool {
+        self.len <= N
+    }
+
+    pub closed spec fn view(self) -> Seq<usize> {
+        self.items@.subrange(0, self.len as int)
+    }
+}
+
+}
+
+/// `Layout::new`, as a free function: `verus_spec` cannot wrap an associated
+/// function that has no receiver.
+#[cfg_attr(verus_only, verifier::loop_isolation(false))]
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures
+        match result {
+            Ok(layout) => layout@ == components@ && valid_layout(components@),
+            Err(_) => !valid_layout(components@),
+        },
+))]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the Verus invariants are stated over the index"
+)]
+fn layout<'a, const N: usize>(components: [Component<'a>; N]) -> Result<Layout<'a, N>, Invalid> {
+    #[cfg_attr(verus_only, verus_spec(
+            invariant
+                forall|j: int, k: int| 0 <= j < i && 0 <= k < components@[j].inside@.len()
+                    ==> #[trigger] edge_ok(components@, j, k),
+        ))]
+    for i in 0..N {
+        let inside = components[i].inside;
+        #[cfg_attr(verus_only, verus_spec(
+                invariant
+                    inside@ == components@[i as int].inside@,
+                    forall|j: int, k: int| 0 <= j < i && 0 <= k < components@[j].inside@.len()
+                        ==> #[trigger] edge_ok(components@, j, k),
+                    forall|done: int| 0 <= done < k ==> #[trigger] edge_ok(components@, i as int, done),
+            ))]
+        for k in 0..inside.len() {
+            let outer = inside[k];
+            proof! {
+                assert(outer_of(components@, i as int, k as int) == outer);
+            }
+            if outer >= N {
+                proof! {
+                    assert(!edge_ok(components@, i as int, k as int));
+                }
+                return Err(Invalid::Unknown {
+                    component: i,
+                    inside: outer,
+                });
+            }
+            if outer <= i {
+                proof! {
+                    assert(!edge_ok(components@, i as int, k as int));
+                }
+                return Err(Invalid::OutOfOrder {
+                    component: i,
+                    inside: outer,
+                });
+            }
+            if components[outer].manual {
+                proof! {
+                    assert(!edge_ok(components@, i as int, k as int));
+                }
+                return Err(Invalid::ManualOuter {
+                    component: i,
+                    inside: outer,
+                });
+            }
+        }
+    }
+    Ok(Layout { components })
+}
+
+impl<'a, const N: usize> Layout<'a, N> {
+    /// Checks `components` and keeps a copy.
+    ///
+    /// # Errors
+    ///
+    /// The first [`Invalid`] entry in table order.
+    pub fn new(components: [Component<'a>; N]) -> Result<Self, Invalid> {
+        layout(components)
+    }
+
+    /// Works out where every component stands. A component that is heading to
+    /// users makes everything it ships inside need a release too.
+    ///
+    /// # Errors
+    ///
+    /// [`Regressed`] for the first component whose source is below its newest
+    /// release.
+    #[cfg_attr(verus_only, verifier::loop_isolation(false))]
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures
+            match result {
+                Ok(plan) => plan.layout() == self@
+                    && planned(self@, facts@, plan.states_view(), plan.reasons()),
+                Err(regressed) => regressed.component < N
+                    && own_state(facts@[regressed.component as int]) is None,
+            },
+    ))]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "the Verus invariants are stated over the index"
+    )]
+    pub fn plan(&self, facts: &[Fact; N]) -> Result<Plan<'a, N>, Regressed> {
+        proof! {
+            use_type_invariant(self);
+        }
+        let mut states = [State::UpToDate; N];
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                forall|j: int| 0 <= j < i ==> own_state(facts@[j]) == Some(#[trigger] states@[j]),
+        ))]
+        for i in 0..N {
+            match own(facts[i]) {
+                Some(state) => states[i] = state,
+                None => return Err(Regressed { component: i }),
+            }
+        }
+        proof_decl! {
+            let ghost layout = self.components@;
+            let ghost own = states@;
+        }
+        let mut forced: [Option<usize>; N] = [None; N];
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                valid_layout(layout),
+                forall|j: int| 0 <= j < N ==> (#[trigger] states@[j] == own[j]
+                    || (own[j] is UpToDate && states@[j] is NeedsBump)),
+                forall|j: int| 0 <= j < N ==> (#[trigger] forced@[j] is Some <==> states@[j] != own[j]),
+                forall|j: int| 0 <= j < N ==> (#[trigger] forced@[j] matches Some(inner)
+                    ==> inner < i && ships_inside(layout, inner as int, j)
+                        && outgoing(layout, states@, inner as int)),
+                forall|p: int, k: int| 0 <= p < i && 0 <= k < layout[p].inside@.len()
+                    && outgoing(layout, states@, p)
+                    ==> !(states@[#[trigger] outer_of(layout, p, k)] is UpToDate),
+        ))]
+        for i in 0..N {
+            let component = self.components[i];
+            let heading_out = match states[i] {
+                State::Ready => true,
+                State::NeedsBump => !component.manual,
+                State::UpToDate => false,
+            };
+            if heading_out {
+                let inside = component.inside;
+                proof_decl! {
+                    let ghost entry = states@;
+                }
+                #[cfg_attr(verus_only, verus_spec(
+                    invariant
+                        inside@ == layout[i as int].inside@,
+                        valid_layout(layout),
+                        outgoing(layout, states@, i as int),
+                        forall|j: int| 0 <= j <= i ==> #[trigger] states@[j] == entry[j],
+                        forall|j: int| 0 <= j < N ==> (#[trigger] states@[j] == own[j]
+                            || (own[j] is UpToDate && states@[j] is NeedsBump)),
+                        forall|j: int| 0 <= j < N ==> (#[trigger] forced@[j] is Some <==> states@[j] != own[j]),
+                        forall|j: int| 0 <= j < N ==> (#[trigger] forced@[j] matches Some(inner)
+                            ==> inner <= i && ships_inside(layout, inner as int, j)
+                                && outgoing(layout, states@, inner as int)),
+                        forall|p: int, k: int| 0 <= p < i && 0 <= k < layout[p].inside@.len()
+                            && outgoing(layout, states@, p)
+                            ==> !(states@[#[trigger] outer_of(layout, p, k)] is UpToDate),
+                        forall|done: int| 0 <= done < k
+                            ==> !(states@[#[trigger] outer_of(layout, i as int, done)] is UpToDate),
+                ))]
+                for k in 0..inside.len() {
+                    let outer = inside[k];
+                    proof! {
+                        assert(edge_ok(layout, i as int, k as int));
+                        assert(outer_of(layout, i as int, k as int) == outer);
+                        assert forall|p: int, at: int| 0 <= p <= i && 0 <= at < layout[p].inside@.len()
+                            implies p < #[trigger] outer_of(layout, p, at) by {
+                            assert(edge_ok(layout, p, at));
+                        }
+                    }
+                    if states[outer] == State::UpToDate {
+                        states[outer] = State::NeedsBump;
+                        forced[outer] = Some(i);
+                        proof! {
+                            assert(listed_below(layout, i as int, outer as int, layout[i as int].inside@.len() as int));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Plan {
+            components: self.components,
+            states,
+            forced,
+        })
+    }
+}
+
+impl<'a, const N: usize> Plan<'a, N> {
+    /// Where each component stands.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures
+            result@ == self.states_view(),
+    ))]
+    pub fn states(&self) -> &[State; N] {
+        &self.states
+    }
+
+    /// For each component that needs a bump only because something inside it
+    /// is heading to users: the first such component.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures
+            result@ == self.reasons(),
+    ))]
+    pub fn forced_by(&self) -> &[Option<usize>; N] {
+        &self.forced
+    }
+
+    /// The components to bump: every changed one that is not manual.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures
+            lists(result@, bump_mask(self.layout(), self.states_view(), None)),
+    ))]
+    pub fn bump(&self) -> Order<N> {
+        proof! {
+            use_type_invariant(self);
+        }
+        collect(&bumps(&self.components, &self.states, None))
+    }
+
+    /// The components to bump when the caller names them: those at `names`,
+    /// then whatever each of them ships inside, and so on outwards. A
+    /// component already ahead of its newest release is not raised again.
+    ///
+    /// # Panics
+    ///
+    /// When a name is not a table position.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        requires
+            forall|k: int| 0 <= k < names@.len() ==> #[trigger] names@[k] < N,
+        ensures
+            lists(result@, bump_mask(self.layout(), self.states_view(), Some(names_mask(names@, N as int)))),
+    ))]
+    pub fn bump_only(&self, names: &[usize]) -> Order<N> {
+        proof! {
+            use_type_invariant(self);
+        }
+        let named = mask(names);
+        collect(&bumps(&self.components, &self.states, Some(&named)))
+    }
+
+    /// Every component ahead of its newest release, in the order to publish
+    /// them: each one before what it ships inside.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Stranded`] when one of them ships inside a component that
+    /// still needs a bump.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures
+            publishes(self.layout(), self.states_view(), None, result),
+    ))]
+    pub fn publish(&self) -> Result<Order<N>, Refusal> {
+        proof! {
+            use_type_invariant(self);
+        }
+        match choose(&self.components, &self.states, None) {
+            Ok(chosen) => Ok(collect(&chosen)),
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// The components at `names`, in the order to publish them.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotReady`] when a named component is not ahead of its newest
+    /// release, and [`Refusal::Stranded`] when one ships inside a component
+    /// that is not ahead of its own.
+    ///
+    /// # Panics
+    ///
+    /// When a name is not a table position.
+    #[cfg_attr(verus_only, verus_spec(result =>
+        requires
+            forall|k: int| 0 <= k < names@.len() ==> #[trigger] names@[k] < N,
+        ensures
+            publishes(self.layout(), self.states_view(), Some(names_mask(names@, N as int)), result),
+    ))]
+    pub fn publish_only(&self, names: &[usize]) -> Result<Order<N>, Refusal> {
+        proof! {
+            use_type_invariant(self);
+        }
+        let named = mask(names);
+        match choose(&self.components, &self.states, Some(&named)) {
+            Ok(chosen) => Ok(collect(&chosen)),
+            Err(refusal) => Err(refusal),
+        }
+    }
 }
 
 impl<const N: usize> Order<N> {
@@ -295,414 +537,366 @@ impl<const N: usize> Order<N> {
 #[cfg(verus_only)]
 verus! {
 
-impl<const N: usize> Order<N> {
-    #[verifier::type_invariant]
-    pub closed spec fn well_formed(self) -> bool {
-        self.len <= N
-    }
-
-    /// The released indices, in order.
-    pub closed spec fn view(self) -> Seq<usize> {
-        self.items@.subrange(0, self.len as int)
+/// What `publish` and `publish_only` promise about their result.
+pub open spec fn publishes<const N: usize>(
+    layout: Seq<Component>,
+    states: Seq<State>,
+    named: Option<Seq<bool>>,
+    result: Result<Order<N>, Refusal>,
+) -> bool {
+    match result {
+        Ok(order) => {
+            &&& forall|i: int| 0 <= i < N ==> !not_ready(states, named, i)
+            &&& forall|i: int, k: int| 0 <= i < N && 0 <= k < layout[i].inside@.len()
+                ==> !#[trigger] stranded(layout, states, named, i, k)
+            &&& lists(order@, chosen_mask(states, named))
+        },
+        Err(Refusal::NotReady { component }) => component < N && not_ready(states, named, component as int),
+        Err(Refusal::Stranded { component, inside }) => {
+            &&& component < N
+            &&& inside < N
+            &&& ships_inside(layout, component as int, inside as int)
+            &&& chosen(states, named, component as int)
+            &&& !(states[inside as int] is Ready)
+        },
     }
 }
 
 }
 
-#[cfg_attr(verus_only, verus_spec(result =>
-    ensures
-        result == rank_of(kind),
-))]
-fn rank(kind: Kind) -> u8 {
-    match kind {
-        Kind::Part { .. } => 0,
-        Kind::App => 1,
-        Kind::Other => 2,
-    }
-}
-
-/// The components `publish` releases: the `named` ones, or without names every
-/// one ahead of its tag. Parts come first, because an application's manifest
-/// entry hashes the published net core and bootloader.
+/// Marks the table positions at `names`.
 #[cfg_attr(verus_only, verifier::loop_isolation(false))]
 #[cfg_attr(verus_only, verus_spec(result =>
     requires
-        valid_table(table@),
+        forall|k: int| 0 <= k < names@.len() ==> #[trigger] names@[k] < N,
     ensures
-        match result {
-            Ok(order) => {
-                &&& forall|i: int| 0 <= i < N ==> !not_ready(states@, names(named), i)
-                &&& forall|i: int| 0 <= i < N ==> !no_carrier(table@, states@, names(named), i)
-                &&& releases(table@, states@, names(named), order@)
-            },
-            Err(Refusal::NotReady(i)) => {
-                &&& i < N
-                &&& not_ready(states@, names(named), i as int)
-                &&& forall|j: int| 0 <= j < i ==> !not_ready(states@, names(named), j)
-            },
-            Err(Refusal::NoCarrier { part, app }) => {
-                &&& part < N
-                &&& is_part_of(table@, part as int, app as int)
-                &&& no_carrier(table@, states@, names(named), part as int)
-                &&& forall|j: int| 0 <= j < N ==> !not_ready(states@, names(named), j)
-                &&& forall|j: int| 0 <= j < part ==> !no_carrier(table@, states@, names(named), j)
-            },
-        },
+        result@ == names_mask(names@, N as int),
 ))]
-pub fn publish_order<const N: usize>(
-    table: &[Link; N],
-    states: &[State; N],
-    named: Option<&[bool; N]>,
-) -> Result<Order<N>, Refusal> {
-    let mut chosen = [false; N];
+fn mask<const N: usize>(names: &[usize]) -> [bool; N] {
+    let mut mask = [false; N];
     #[cfg_attr(verus_only, verus_spec(
         invariant
-            forall|j: int| 0 <= j < i ==> #[trigger] chosen@[j] == spec::chosen(states@, names(named), j),
-            forall|j: int| 0 <= j < i ==> !not_ready(states@, names(named), j),
+            forall|j: int| 0 <= j < N ==> #[trigger] mask@[j] == named_below(names@, j, k as int),
     ))]
-    for i in 0..N {
-        chosen[i] = match named {
-            Some(named) => named[i],
-            None => states[i] == State::Ready,
-        };
-        if chosen[i] && states[i] != State::Ready {
-            return Err(Refusal::NotReady(i));
-        }
-    }
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            valid_table(table@),
-            forall|j: int| 0 <= j < i ==> !no_carrier(table@, states@, names(named), j),
-    ))]
-    for i in 0..N {
-        let kind = table[i].kind;
-        match kind {
-            Kind::Part { app } if chosen[i] && states[app] != State::Ready => {
-                return Err(Refusal::NoCarrier { part: i, app });
+    for k in 0..names.len() {
+        proof! {
+            assert forall|j: int| 0 <= j < N implies
+                #[trigger] named_below(names@, j, k + 1)
+                    == (named_below(names@, j, k as int) || names@[k as int] == j) by {
+                lemma_named_step(names@, j, k as int);
             }
-            _ => {}
         }
+        mask[names[k]] = true;
     }
+    proof! {
+        assert(mask@ =~= names_mask(names@, N as int));
+    }
+    mask
+}
+
+/// The positions `mask` marks, lowest first.
+#[cfg_attr(verus_only, verifier::loop_isolation(false))]
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures
+        lists(result@, mask@),
+))]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the Verus invariants are stated over the index"
+)]
+fn collect<const N: usize>(mask: &[bool; N]) -> Order<N> {
     let mut items = [0usize; N];
     let mut len = 0usize;
     #[cfg_attr(verus_only, verus_spec(
         invariant
-            len <= N,
-            forall|p: int| 0 <= p < len ==> #[trigger] items@[p] < N,
-            forall|p: int| 0 <= p < len ==> spec::chosen(states@, names(named), #[trigger] items@[p] as int),
-            forall|p: int| 0 <= p < len ==> rank_of(table@[#[trigger] items@[p] as int].kind) < wave,
-            forall|j: int| 0 <= j < N && spec::chosen(states@, names(named), j) && rank_of(table@[j].kind) < wave
-                ==> items@.subrange(0, len as int).contains(j as usize),
-            in_release_order(table@, items@.subrange(0, len as int)),
+            len <= i,
+            forall|p: int| 0 <= p < len ==> #[trigger] items@[p] < i,
+            forall|p: int, q: int| 0 <= p < q < len ==> #[trigger] items@[p] < #[trigger] items@[q],
+            forall|j: int| 0 <= j < i ==> (items@.subrange(0, len as int).contains(j as usize) <==> #[trigger] mask@[j]),
     ))]
-    for wave in 0..3 {
-        #[cfg_attr(verus_only, verus_spec(
-            invariant
-                0 <= wave < 3,
-                len <= N,
-                forall|j: int| 0 <= j < N ==> #[trigger] chosen@[j] == spec::chosen(states@, names(named), j),
-                forall|p: int| 0 <= p < len ==> #[trigger] items@[p] < N,
-                forall|p: int| 0 <= p < len ==> spec::chosen(states@, names(named), #[trigger] items@[p] as int),
-                forall|p: int| 0 <= p < len ==> {
-                    let at = #[trigger] items@[p] as int;
-                    rank_of(table@[at].kind) < wave || (rank_of(table@[at].kind) == wave && at < i)
-                },
-                forall|j: int| 0 <= j < N && spec::chosen(states@, names(named), j)
-                    && (rank_of(table@[j].kind) < wave || (rank_of(table@[j].kind) == wave && j < i))
-                    ==> items@.subrange(0, len as int).contains(j as usize),
-                in_release_order(table@, items@.subrange(0, len as int)),
-        ))]
-        for i in 0..N {
-            if chosen[i] && rank(table[i].kind) == wave {
-                proof_decl! {
-                    let ghost released = items@.subrange(0, len as int);
-                }
-                proof! {
-                    lemma_release_next(table@, released, i, wave as int);
-                }
-                items[len] = i;
-                len += 1;
-                proof! {
-                    assert(items@.subrange(0, len as int) =~= released.push(i));
+    for i in 0..N {
+        proof! {
+            let listed = items@.subrange(0, len as int);
+            if listed.contains(i) {
+                let at = choose|at: int| 0 <= at < listed.len() && listed[at] == i;
+                assert(items@[at] < i);
+            }
+        }
+        if mask[i] {
+            proof_decl! {
+                let ghost listed = items@.subrange(0, len as int);
+            }
+            items[len] = i;
+            len += 1;
+            proof! {
+                assert(items@.subrange(0, len as int) =~= listed.push(i));
+                assert forall|j: int| 0 <= j <= i implies
+                    (listed.push(i).contains(j as usize) <==> #[trigger] mask@[j]) by {
+                    if j == i {
+                        assert(listed.push(i)[listed.len() as int] == i);
+                    } else if listed.contains(j as usize) {
+                        let at = choose|at: int| 0 <= at < listed.len() && listed[at] == j as usize;
+                        assert(listed.push(i)[at] == j as usize);
+                    } else if listed.push(i).contains(j as usize) {
+                        let at = choose|at: int| 0 <= at < listed.push(i).len() && listed.push(i)[at] == j as usize;
+                        assert(listed[at] == j as usize);
+                    }
                 }
             }
         }
     }
-    Ok(Order { items, len })
+    Order { items, len }
 }
 
-/// The next counter, only when it stays within the component's representation.
+/// The components a bump raises. `named` marks the ones the caller asked for.
+#[cfg_attr(verus_only, verifier::loop_isolation(false))]
 #[cfg_attr(verus_only, verus_spec(result =>
+    requires
+        valid_layout(layout@),
     ensures
-        result == (if value < maximum { Some((value + 1) as u64) } else { None::<u64> }),
+        result@ == bump_mask(layout@, states@, named_view(named)),
 ))]
-pub fn successor(value: u64, maximum: u64) -> Option<u64> {
-    match value.checked_add(1) {
-        Some(next) if next <= maximum => Some(next),
-        _ => None,
-    }
-}
-
-/// Lexicographic `version >= want`, spelled out because Verus has no
-/// specification for array comparison.
-#[cfg_attr(verus_only, verus_spec(result =>
-    ensures
-        result == at_least_spec(version, want),
-))]
-fn at_least(version: [u64; 3], want: [u64; 3]) -> bool {
-    if version[0] != want[0] {
-        return version[0] > want[0];
-    }
-    if version[1] != want[1] {
-        return version[1] > want[1];
-    }
-    version[2] >= want[2]
-}
-
-/// Index of the oldest Desktop release from which every later one speaks at
-/// least `want`. `speaks` is oldest first; `None` marks a release without the
-/// wire constant.
-#[cfg_attr(verus_only, verus_spec(result =>
-    ensures
-        match result {
-            Some(floor) => {
-                &&& floor < speaks@.len()
-                &&& forall|later: int| floor <= later < speaks@.len() ==> covers(want, speaks@, later)
-                &&& floor == 0 || !covers(want, speaks@, floor - 1)
-            },
-            None => speaks@.len() == 0 || !covers(want, speaks@, speaks@.len() - 1),
-        },
-))]
-pub fn oldest_covering(want: [u64; 3], speaks: &[Option<[u64; 3]>]) -> Option<usize> {
-    let mut floor = None;
-    let mut i = speaks.len();
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the Verus invariants are stated over the index"
+)]
+fn bumps<const N: usize>(
+    layout: &[Component<'_>; N],
+    states: &[State; N],
+    named: Option<&[bool; N]>,
+) -> [bool; N] {
+    let mut raise = [false; N];
     #[cfg_attr(verus_only, verus_spec(
         invariant
-            i <= speaks@.len(),
-        invariant_except_break
-            forall|later: int| i <= later < speaks@.len() ==> covers(want, speaks@, later),
-            floor == (if i < speaks@.len() { Some(i) } else { None::<usize> }),
-        ensures
-            match floor {
-                Some(floor) => {
-                    &&& floor < speaks@.len()
-                    &&& forall|later: int| floor <= later < speaks@.len() ==> covers(want, speaks@, later)
-                    &&& floor == 0 || !covers(want, speaks@, floor - 1)
-                },
-                None => speaks@.len() == 0 || !covers(want, speaks@, speaks@.len() - 1),
-            },
-        decreases i,
+            forall|j: int| 0 <= j < i ==> #[trigger] raise@[j] == asked(layout@, states@, named_view(named), j),
     ))]
-    while i > 0 {
-        i -= 1;
-        let spoken = speaks[i];
-        match spoken {
-            Some(version) if at_least(version, want) => floor = Some(i),
-            _ => break,
+    for i in 0..N {
+        raise[i] = match named {
+            Some(named) => named[i],
+            None => states[i] == State::NeedsBump && !layout[i].manual,
+        };
+    }
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            valid_layout(layout@),
+            forall|j: int| 0 <= j < N ==> #[trigger] raise@[j] == (
+                asked(layout@, states@, named_view(named), j)
+                || pulled_below(layout@, states@, named_view(named), j, i as int)),
+    ))]
+    for i in 0..N {
+        proof! {
+            lemma_wanted_unfolds(layout@, states@, named_view(named), i as int);
+            assert forall|j: int| 0 <= j < N implies
+                #[trigger] pulled_below(layout@, states@, named_view(named), j, i + 1)
+                    == (pulled_below(layout@, states@, named_view(named), j, i as int)
+                        || (ships_inside(layout@, i as int, j)
+                            && wanted(layout@, states@, named_view(named), i as int))) by {
+                lemma_pulled_step(layout@, states@, named_view(named), j, i as int);
+            }
+        }
+        if raise[i] {
+            let inside = layout[i].inside;
+            #[cfg_attr(verus_only, verus_spec(
+                invariant
+                    inside@ == layout@[i as int].inside@,
+                    valid_layout(layout@),
+                    wanted(layout@, states@, named_view(named), i as int),
+                    forall|j: int| 0 <= j < N ==> #[trigger] raise@[j] == (
+                        asked(layout@, states@, named_view(named), j)
+                        || pulled_below(layout@, states@, named_view(named), j, i as int)
+                        || listed_below(layout@, i as int, j, k as int)),
+            ))]
+            for k in 0..inside.len() {
+                let outer = inside[k];
+                proof! {
+                    assert(edge_ok(layout@, i as int, k as int));
+                    assert(outer_of(layout@, i as int, k as int) == outer);
+                    assert forall|j: int| 0 <= j < N implies
+                        #[trigger] listed_below(layout@, i as int, j, k + 1)
+                            == (listed_below(layout@, i as int, j, k as int) || outer == j) by {
+                        lemma_listed_step(layout@, i as int, j, k as int);
+                    }
+                }
+                raise[outer] = true;
+            }
         }
     }
-    floor
+    proof! {
+        assert forall|j: int| 0 <= j < N implies
+            #[trigger] raise@[j] == wanted(layout@, states@, named_view(named), j) by {
+            lemma_wanted_unfolds(layout@, states@, named_view(named), j);
+            lemma_pulled_saturates(layout@, states@, named_view(named), j, N as int);
+        }
+    }
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            valid_layout(layout@),
+            forall|j: int| 0 <= j < i ==> #[trigger] raise@[j] == bump_mask(layout@, states@, named_view(named))[j],
+            forall|j: int| i <= j < N ==> #[trigger] raise@[j] == wanted(layout@, states@, named_view(named), j),
+    ))]
+    for i in 0..N {
+        if states[i] == State::Ready {
+            raise[i] = false;
+        }
+    }
+    proof! {
+        assert(raise@ =~= bump_mask(layout@, states@, named_view(named)));
+    }
+    raise
 }
 
-#[cfg(kani)]
-mod proofs {
-    use super::*;
-
-    const N: usize = COMPONENT_COUNT;
-    /// `#[kani::unwind]` takes a literal: one more than the longest loop.
-    const _: () = {
-        assert!(N + 1 == 12);
-    };
-    const DESKTOPS: usize = 5;
-
-    fn any_table() -> [Link; N] {
-        let table: [Link; N] = kani::any();
-        kani::assume(valid(&table));
-        table
-    }
-
-    /// What `plan` hands to `bump` and `publish`: any states, after delivery.
-    fn any_plan(table: &[Link; N]) -> ([State; N], [bool; N]) {
-        let mut states: [State; N] = kani::any();
-        let behind: [bool; N] = kani::any();
-        deliver(table, &mut states, &behind);
-        (states, behind)
-    }
-
-    fn on_its_way(table: &[Link; N], states: &[State; N], i: usize) -> bool {
-        states[i] == State::Ready || (states[i] == State::NeedsBump && !table[i].manual)
-    }
-
-    #[kani::proof]
-    fn a_changed_component_is_never_current_and_a_regression_is_refused() {
-        let a: u8 = kani::any();
-        let b: u8 = kani::any();
-        let ahead = if kani::any() { Some(a.cmp(&b)) } else { None };
-        let changed: bool = kani::any();
-        let state = state(ahead, changed);
-        assert_eq!(state.is_err(), ahead == Some(Ordering::Less));
-        if changed {
-            assert!(state != Ok(State::Current));
-        }
-        if ahead == Some(Ordering::Equal) && !changed {
-            assert!(state == Ok(State::Current));
-        }
-        if ahead.is_none() || ahead == Some(Ordering::Greater) {
-            assert!(state == Ok(State::Ready));
-        }
-    }
-
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn delivery_leaves_no_outgoing_part_without_a_releasing_application() {
-        let table = any_table();
-        let before: [State; N] = kani::any();
-        let behind: [bool; N] = kani::any();
-        let mut states = before;
-        let forced = deliver(&table, &mut states, &behind);
-        for i in 0..N {
-            if let Kind::Part { app } = table[i].kind {
-                if on_its_way(&table, &states, i) || behind[i] {
-                    assert!(states[app] != State::Current);
-                }
-            }
-            let raised = before[i] == State::Current && states[i] == State::NeedsBump;
-            assert!(states[i] == before[i] || (raised && table[i].kind == Kind::App));
-            assert_eq!(forced[i].is_some(), raised);
-        }
-        let mut again = states;
-        deliver(&table, &mut again, &behind);
-        assert!(again == states);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn one_bump_leaves_nothing_to_bump_and_publish_then_accepts_everything_ready() {
-        let table = any_table();
-        let (states, behind) = any_plan(&table);
-        let set = bump_set(&table, &states, None);
-        let mut after = states;
-        let mut behind_after = behind;
-        for i in 0..N {
-            if states[i] == State::NeedsBump && !table[i].manual {
-                assert!(set[i]);
-            }
-            if set[i] {
-                assert!(states[i] != State::Ready);
-                after[i] = State::Ready;
-                if let Kind::Part { app } = table[i].kind {
-                    assert!(set[app] || states[app] == State::Ready);
-                    behind_after[i] = true;
-                }
-            }
-        }
-        deliver(&table, &mut after, &behind_after);
-        let again = bump_set(&table, &after, None);
-        for i in 0..N {
-            assert!(!again[i]);
-        }
-        let Ok(order) = publish_order(&table, &after, None) else {
-            panic!("publish refused a plan that bump had settled");
+/// The components a publish releases, or why it releases none.
+#[cfg_attr(verus_only, verifier::loop_isolation(false))]
+#[cfg_attr(verus_only, verus_spec(result =>
+    requires
+        valid_layout(layout@),
+    ensures
+        match result {
+            Ok(picked) => {
+                &&& picked@ == chosen_mask(states@, named_view(named))
+                &&& forall|i: int| 0 <= i < N ==> !not_ready(states@, named_view(named), i)
+                &&& forall|i: int, k: int| 0 <= i < N && 0 <= k < layout@[i].inside@.len()
+                    ==> !#[trigger] stranded(layout@, states@, named_view(named), i, k)
+            },
+            Err(Refusal::NotReady { component }) => component < N
+                && not_ready(states@, named_view(named), component as int),
+            Err(Refusal::Stranded { component, inside }) => {
+                &&& component < N
+                &&& inside < N
+                &&& ships_inside(layout@, component as int, inside as int)
+                &&& chosen(states@, named_view(named), component as int)
+                &&& !(states@[inside as int] is Ready)
+            },
+        },
+))]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the Verus invariants are stated over the index"
+)]
+fn choose<const N: usize>(
+    layout: &[Component<'_>; N],
+    states: &[State; N],
+    named: Option<&[bool; N]>,
+) -> Result<[bool; N], Refusal> {
+    let mut picked = [false; N];
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            forall|j: int| 0 <= j < i ==> #[trigger] picked@[j] == chosen(states@, named_view(named), j),
+            forall|j: int| 0 <= j < i ==> !not_ready(states@, named_view(named), j),
+    ))]
+    for i in 0..N {
+        picked[i] = match named {
+            Some(named) => named[i],
+            None => states[i] == State::Ready,
         };
-        let mut ready = 0;
-        for i in 0..N {
-            if after[i] == State::Ready {
-                ready += 1;
-            }
+        if picked[i] && states[i] != State::Ready {
+            return Err(Refusal::NotReady { component: i });
         }
-        assert_eq!(order.len, ready);
     }
-
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn a_named_bump_brings_the_application_of_each_part() {
-        let table = any_table();
-        let (states, _) = any_plan(&table);
-        let named: [bool; N] = kani::any();
-        let set = bump_set(&table, &states, Some(&named));
-        for i in 0..N {
-            if named[i] && states[i] != State::Ready {
-                assert!(set[i]);
-            }
-            if set[i] {
-                assert!(states[i] != State::Ready);
-                if let Kind::Part { app } = table[i].kind {
-                    assert!(set[app] || states[app] == State::Ready);
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            valid_layout(layout@),
+            forall|j: int, k: int| 0 <= j < i && 0 <= k < layout@[j].inside@.len()
+                ==> !#[trigger] stranded(layout@, states@, named_view(named), j, k),
+    ))]
+    for i in 0..N {
+        if picked[i] {
+            let inside = layout[i].inside;
+            #[cfg_attr(verus_only, verus_spec(
+                invariant
+                    inside@ == layout@[i as int].inside@,
+                    valid_layout(layout@),
+                    forall|done: int| 0 <= done < k
+                        ==> !#[trigger] stranded(layout@, states@, named_view(named), i as int, done),
+            ))]
+            for k in 0..inside.len() {
+                let outer = inside[k];
+                proof! {
+                    assert(edge_ok(layout@, i as int, k as int));
+                    assert(outer_of(layout@, i as int, k as int) == outer);
+                }
+                if states[outer] != State::Ready {
+                    proof! {
+                        assert(listed_below(layout@, i as int, outer as int, layout@[i as int].inside@.len() as int));
+                    }
+                    return Err(Refusal::Stranded {
+                        component: i,
+                        inside: outer,
+                    });
                 }
             }
         }
     }
-
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn publish_releases_only_what_is_ready_with_its_carrier_and_parts_first() {
-        let table = any_table();
-        let states: [State; N] = kani::any();
-        let named: Option<[bool; N]> = kani::any();
-        let Ok(order) = publish_order(&table, &states, named.as_ref()) else {
-            return;
-        };
-        assert!(order.len <= N);
-        let mut seen = [false; N];
-        let mut wave = 0;
-        for position in 0..order.len {
-            let i = order.items[position];
-            assert!(!seen[i]);
-            seen[i] = true;
-            assert!(states[i] == State::Ready);
-            if let Kind::Part { app } = table[i].kind {
-                assert!(states[app] == State::Ready);
-            }
-            assert!(rank(table[i].kind) >= wave);
-            wave = rank(table[i].kind);
-        }
-        for i in 0..N {
-            let wanted = match &named {
-                Some(named) => named[i],
-                None => states[i] == State::Ready,
-            };
-            assert_eq!(seen[i], wanted);
-            if named.is_none() && seen[i] {
-                if let Kind::Part { app } = table[i].kind {
-                    assert!(seen[app]);
-                }
-            }
-        }
+    proof! {
+        assert(picked@ =~= chosen_mask(states@, named_view(named)));
     }
+    Ok(picked)
+}
 
-    #[kani::proof]
-    #[kani::unwind(7)]
-    #[kani::solver(kissat)]
-    fn the_desktop_floor_covers_every_later_release_and_is_the_oldest_that_does() {
-        let want: [u64; 3] = kani::any();
-        let all: [Option<[u64; 3]>; DESKTOPS] = kani::any();
-        let len: usize = kani::any();
-        kani::assume(len <= DESKTOPS);
-        let speaks = &all[..len];
-        let covers = |i: usize| speaks[i].is_some_and(|version| version >= want);
-        match oldest_covering(want, speaks) {
-            Some(floor) => {
-                assert!(floor < len);
-                let later: usize = kani::any();
-                kani::assume(later >= floor && later < len);
-                assert!(covers(later));
-                assert!(floor == 0 || !covers(floor - 1));
-            }
-            None => {
-                assert!(len == 0 || !covers(len - 1));
-            }
-        }
-    }
+#[cfg(verus_only)]
+verus! {
 
-    #[kani::proof]
-    fn successor_matches_checked_ordered_increment_for_all_u64_pairs() {
-        let value: u64 = kani::any();
-        let maximum: u64 = kani::any();
-        let expected = if value < maximum {
-            Some(value + 1)
-        } else {
-            None
-        };
-        assert_eq!(successor(value, maximum), expected);
+pub open spec fn named_view<const N: usize>(named: Option<&[bool; N]>) -> Option<Seq<bool>> {
+    match named {
+        Some(named) => Some(named@),
+        None => None,
     }
 }
+
+}
+
+#[cfg_attr(verus_only, verifier::external)]
+impl fmt::Display for Invalid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Unknown { component, inside } => write!(
+                f,
+                "component {component} ships inside {inside}, which is not in the table"
+            ),
+            Self::OutOfOrder { component, inside } => write!(
+                f,
+                "component {component} ships inside {inside}, which has to be listed after it"
+            ),
+            Self::ManualOuter { component, inside } => write!(
+                f,
+                "component {component} ships inside {inside}, which is manual and could stay behind"
+            ),
+        }
+    }
+}
+
+#[cfg_attr(verus_only, verifier::external)]
+impl fmt::Display for Regressed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the source of component {} is below its newest release",
+            self.component
+        )
+    }
+}
+
+#[cfg_attr(verus_only, verifier::external)]
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::NotReady { component } => {
+                write!(
+                    f,
+                    "component {component} is not ahead of its newest release"
+                )
+            }
+            Self::Stranded { component, inside } => write!(
+                f,
+                "component {component} would reach nobody: no release of {inside} is on its way"
+            ),
+        }
+    }
+}
+
+#[cfg_attr(verus_only, verifier::external)]
+impl core::error::Error for Invalid {}
+#[cfg_attr(verus_only, verifier::external)]
+impl core::error::Error for Regressed {}
+#[cfg_attr(verus_only, verifier::external)]
+impl core::error::Error for Refusal {}

@@ -1,305 +1,288 @@
+//! The release properties, each checked for tables of any size.
+
 use core::cmp::Ordering;
+
 use vstd::prelude::*;
 
+use super::lemmas::{lemma_inner_first, lemma_nothing_asked_nothing_wanted, lemma_wanted_spreads};
 use super::spec::{
-    asked, at_least_spec, before, bumped, carries_asked_below, chosen, covers, forced, forces,
-    forcing_below, in_release_order, is_part_of, names, outgoing, releases, valid_table,
+    asked, bump_mask, bumped, chosen_mask, lists, named_below, names_mask, outer_of, outgoing,
+    own_state, planned, settled, ships_inside, valid_layout, wanted,
 };
-use super::{
-    Kind, Link, State, bump_set, deliver, oldest_covering, publish_order, state, successor,
-};
+use super::{Component, Fact, Layout, Plan, State, own};
 
 verus! {
 
-fn a_changed_component_is_never_current_and_a_regression_is_refused(
-    ahead: Option<Ordering>,
-    changed: bool,
-) {
-    let result = state(ahead, changed);
-    assert(result is Err <==> ahead == Some(Ordering::Less));
-    match ahead {
-        None => { assert(result == Ok::<State, super::Regressed>(State::Ready)); },
-        Some(Ordering::Less) => { assert(result is Err); },
-        Some(Ordering::Equal) => {
-            assert(result == Ok::<State, super::Regressed>(if changed { State::NeedsBump } else { State::Current }));
+fn a_changed_component_is_never_up_to_date_and_a_regression_is_refused(fact: Fact) {
+    let result = own(fact);
+    match fact {
+        Fact::Unreleased => {
+            assert(result == Some(State::Ready));
         },
-        Some(Ordering::Greater) => { assert(result == Ok::<State, super::Regressed>(State::Ready)); },
-    }
-    assert(changed ==> result != Ok::<State, super::Regressed>(State::Current));
-    assert(ahead == Some(Ordering::Equal) && !changed ==> result == Ok::<State, super::Regressed>(State::Current));
-    assert(ahead is None || ahead == Some(Ordering::Greater) ==> result == Ok::<State, super::Regressed>(State::Ready));
-}
-
-fn delivery_leaves_no_outgoing_part_without_a_releasing_application<const N: usize>(
-    table: &[Link; N],
-    initial: [State; N],
-    behind: &[bool; N],
-)
-    requires valid_table(table@),
-{
-    let mut states = initial;
-    let result = deliver(table, &mut states, behind);
-    assert forall|i: int| 0 <= i < N implies
-        states@[i] == initial@[i]
-        || (initial@[i] is Current && states@[i] is NeedsBump && table@[i].kind is App) by {
-        if forced(table@, initial@, behind@, i) {
-            let part = choose|part: int| part < N && forces(table@, initial@, behind@, part, i);
-            assert(table@[part].kind is Part);
-        }
-    }
-    assert forall|i: int| 0 <= i < N implies
-        (result@[i] is Some <==> initial@[i] is Current && states@[i] is NeedsBump) by {}
-    assert forall|part: int, app: int|
-        0 <= part < N && 0 <= app < N
-            && is_part_of(table@, part, app)
-            && outgoing(table@, states@, behind@, part)
-        implies !(states@[app] is Current) by {
-        assert(table@[part].kind is Part);
-        assert(states@[part] == initial@[part]);
-        assert(outgoing(table@, initial@, behind@, part));
-        assert(forces(table@, initial@, behind@, part, app));
-        assert(forcing_below(table@, initial@, behind@, app, N as int));
-    }
-    let mut again = states;
-    deliver(table, &mut again, behind);
-    assert forall|app: int| 0 <= app < N implies !forced(table@, states@, behind@, app) by {
-        if forced(table@, states@, behind@, app) {
-            let part = choose|part: int| part < N && forces(table@, states@, behind@, part, app);
-            assert(table@[part].kind is Part);
-        }
-    }
-    assert(again@ == states@);
-}
-
-#[verifier::loop_isolation(false)]
-fn one_bump_leaves_nothing_to_bump_and_publish_then_accepts_everything_ready<const N: usize>(
-    table: &[Link; N],
-    initial: [State; N],
-    behind: [bool; N],
-)
-    requires valid_table(table@),
-{
-    let mut states = initial;
-    deliver(table, &mut states, &behind);
-    assert forall|part: int, app: int|
-        0 <= part < N && 0 <= app < N && forces(table@, states@, behind@, part, app)
-        implies !(states@[app] is Current) by {
-        assert(table@[part].kind is Part);
-        assert(states@[part] == initial@[part]);
-        assert(forces(table@, initial@, behind@, part, app));
-        assert(forcing_below(table@, initial@, behind@, app, N as int));
-    }
-    let set = bump_set(table, &states, None);
-    let mut after = states;
-    let mut behind_after = behind;
-    for i in 0..N
-        invariant
-            forall|j: int| 0 <= j < N ==> after@[j] == (
-                if j < i && set@[j] { State::Ready } else { states@[j] }),
-            forall|j: int| 0 <= j < N ==> behind_after@[j] == (
-                behind@[j] || (j < i && set@[j] && table@[j].kind is Part)),
-    {
-        assert(states@[i as int] is NeedsBump && !table@[i as int].manual ==> set@[i as int]);
-        if set[i] {
-            assert(!(states@[i as int] is Ready));
-            after[i] = State::Ready;
-            if let Kind::Part { app } = table[i].kind {
-                assert(set@[app as int] || states@[app as int] is Ready) by {
-                    super::lemmas::lemma_parts_carry_nothing(table@, states@, None, i as int, N as int);
-                    assert(asked(table@, states@, None, i as int));
-                    assert(is_part_of(table@, i as int, app as int));
-                    assert(carries_asked_below(table@, states@, None, app as int, N as int));
-                }
-                behind_after[i] = true;
-            }
-        }
-    }
-    assert forall|part: int, app: int|
-        0 <= part < N && 0 <= app < N && is_part_of(table@, part, app)
-            && set@[part]
-        implies after@[app] is Ready by {
-        super::lemmas::lemma_parts_carry_nothing(table@, states@, None, part, N as int);
-        assert(asked(table@, states@, None, part));
-        assert(carries_asked_below(table@, states@, None, app, N as int));
-    }
-    assert forall|app: int| 0 <= app < N
-        implies !forced(table@, after@, behind_after@, app) by {
-        if forced(table@, after@, behind_after@, app) {
-            let part = choose|part: int| part < N && forces(table@, after@, behind_after@, part, app);
-            assert(is_part_of(table@, part, app));
-            assert(table@[part].kind is Part);
-            assert(!set@[part]);
-            assert(forces(table@, states@, behind@, part, app));
-            assert(!(states@[app] is Current));
-        }
-    }
-    let ghost before_delivery = after@;
-    deliver(table, &mut after, &behind_after);
-    assert(after@ == before_delivery);
-    assert forall|i: int| 0 <= i < N implies !asked(table@, after@, None, i) by {
-        assert(set@[i] == bumped(table@, states@, None, i));
-    }
-    let again = bump_set(table, &after, None);
-    assert forall|i: int| 0 <= i < N implies !again@[i] by {
-        if carries_asked_below(table@, after@, None, i, N as int) {
-            let part = choose|part: int| 0 <= part < N
-                && is_part_of(table@, part, i) && asked(table@, after@, None, part);
-        }
-    }
-    assert forall|part: int| 0 <= part < N
-        implies !super::spec::no_carrier(table@, after@, None, part) by {
-        if super::spec::no_carrier(table@, after@, None, part) {
-            let app = match table@[part].kind { Kind::Part { app } => app as int, _ => 0 };
-            assert(forces(table@, states@, behind@, part, app) || set@[part]);
-            assert(table@[part].kind is Part);
-            assert(table@[app].kind is App && !table@[app].manual);
-            assert(set@[app] == bumped(table@, states@, None, app));
-            assert(is_part_of(table@, part, app));
-            if set@[part] {
-                assert(after@[app] is Ready);
-            } else {
-                assert(forces(table@, states@, behind@, part, app));
-                assert(!(states@[app] is Current));
-            }
-            assert(0 <= app < N);
-            assert(after@[app] == (if set@[app] { State::Ready } else { states@[app] }));
-            assert(states@[app] is NeedsBump ==> set@[app]);
-            assert(after@[app] is Ready);
-        }
-    }
-    let published = publish_order(table, &after, None);
-    assert(published is Ok);
-    if let Ok(order) = published {
-        let indices = order.as_slice();
-        assert forall|i: int| 0 <= i < N implies
-            (indices@.contains(i as usize) <==> after@[i] is Ready) by {
-            assert(chosen(after@, None, i) == (after@[i] is Ready));
-        }
-        let ghost ready = Set::<int>::range(0, N as int).filter(|i: int| after@[i] is Ready);
-        let ghost released = indices@.map_values(|i: usize| i as int);
-        assert(released.no_duplicates()) by {
-            assert forall|a: int, b: int|
-                0 <= a < released.len() && 0 <= b < released.len() && a != b
-                implies released[a] != released[b] by {
-                if a < b {
-                    assert(before(table@, indices@[a] as int, indices@[b] as int));
-                } else {
-                    assert(before(table@, indices@[b] as int, indices@[a] as int));
-                }
-            }
-        }
-        proof { released.unique_seq_to_set(); }
-        assert(released.to_set() =~= ready) by {
-            assert forall|value: int| released.to_set().contains(value)
-                implies ready.contains(value) by {
-                let p = choose|p: int| 0 <= p < released.len() && released[p] == value;
-                assert(indices@[p] < N);
-                assert(indices@.contains(value as usize));
-            }
-            assert forall|value: int| ready.contains(value)
-                implies released.to_set().contains(value) by {
-                assert(0 <= value < N && after@[value] is Ready);
-                assert(indices@.contains(value as usize));
-                let p = choose|p: int| 0 <= p < indices@.len() && indices@[p] == value;
-                assert(released[p] == value);
-            }
-        }
-        assert(indices@.len() == ready.len());
-    }
-}
-
-fn a_named_bump_brings_the_application_of_each_part<const N: usize>(
-    table: &[Link; N],
-    initial: [State; N],
-    behind: &[bool; N],
-    named: &[bool; N],
-)
-    requires valid_table(table@),
-{
-    let mut states = initial;
-    deliver(table, &mut states, behind);
-    let set = bump_set(table, &states, Some(named));
-    assert forall|i: int| 0 <= i < N && named@[i] && !(states@[i] is Ready)
-        implies set@[i] by {}
-    assert forall|part: int, app: int|
-        0 <= part < N && 0 <= app < N && set@[part] && is_part_of(table@, part, app)
-        implies set@[app] || states@[app] is Ready by {
-        assert(table@[part].kind is Part);
-        if carries_asked_below(table@, states@, Some(named@), part, N as int) {
-            let nested = choose|nested: int| 0 <= nested < N
-                && is_part_of(table@, nested, part) && asked(table@, states@, Some(named@), nested);
-            assert(table@[part].kind is App);
-        }
-        assert(carries_asked_below(table@, states@, Some(named@), app, N as int));
-    }
-    assert forall|i: int| 0 <= i < N && set@[i] implies !(states@[i] is Ready) by {}
-}
-
-fn publish_releases_only_what_is_ready_with_its_carrier_and_parts_first<const N: usize>(
-    table: &[Link; N],
-    states: &[State; N],
-    named: Option<&[bool; N]>,
-)
-    requires valid_table(table@),
-{
-    let published = publish_order(table, states, named);
-    if let Ok(order) = published {
-        let indices = order.as_slice();
-        assert(in_release_order(table@, indices@));
-        assert(indices@.no_duplicates()) by {
-            assert forall|p: int, q: int|
-                0 <= p < indices@.len() && 0 <= q < indices@.len() && p != q
-                implies indices@[p] != indices@[q] by {
-                if p < q {
-                    assert(before(table@, indices@[p] as int, indices@[q] as int));
-                } else {
-                    assert(before(table@, indices@[q] as int, indices@[p] as int));
-                }
-            }
-        }
-        assert forall|i: int| 0 <= i < N implies
-            (indices@.contains(i as usize) <==> chosen(states@, names(named), i)) by {}
-        assert forall|i: int| 0 <= i < N && indices@.contains(i as usize)
-            implies states@[i] is Ready by {
-            assert(chosen(states@, names(named), i));
-            assert(!super::spec::not_ready(states@, names(named), i));
-        }
-        assert forall|part: int, app: int|
-            0 <= part < N && 0 <= app < N
-                && indices@.contains(part as usize) && is_part_of(table@, part, app)
-            implies states@[app] is Ready
-                && (named is None ==> indices@.contains(app as usize)) by {
-            assert(chosen(states@, names(named), part));
-            assert(!super::spec::no_carrier(table@, states@, names(named), part));
-            if named is None {
-                assert(chosen(states@, None, app));
-            }
-        }
-    }
-}
-
-fn the_desktop_floor_covers_every_later_release_and_is_the_oldest_that_does(
-    want: [u64; 3],
-    speaks: &[Option<[u64; 3]>],
-) {
-    let result = oldest_covering(want, speaks);
-    match result {
-        Some(floor) => {
-            assert(floor < speaks.len());
-            assert forall|later: int| floor <= later < speaks@.len()
-                implies covers(want, speaks@, later) by {}
-            assert(floor == 0 || !covers(want, speaks@, floor - 1));
+        Fact::Released { source, changed } => {
+            assert(result is None <==> source == Ordering::Less);
+            assert(changed ==> result != Some(State::UpToDate));
+            assert(source == Ordering::Equal && !changed ==> result == Some(State::UpToDate));
+            assert(source == Ordering::Greater ==> result == Some(State::Ready));
         },
-        None => { assert(speaks@.len() == 0 || !covers(want, speaks@, speaks@.len() - 1)); },
     }
 }
 
-fn successor_matches_checked_ordered_increment_for_all_u64_pairs(value: u64, maximum: u64) {
-    let result = successor(value, maximum);
-    if value < maximum {
-        assert(result == Some((value + 1) as u64));
-    } else {
-        assert(result is None);
+fn planning_strands_nothing_and_forces_only_what_carries_something_outgoing<'a, const N: usize>(
+    table: &Layout<'a, N>,
+    facts: &[Fact; N],
+) {
+    let plan = match table.plan(facts) {
+        Ok(plan) => plan,
+        Err(_) => return ,
+    };
+    let states = plan.states();
+    let reasons = plan.forced_by();
+    assert forall|inner: int, outer: int|
+        ships_inside(table@, inner, outer) && outgoing(table@, states@, inner) implies !(states@[outer] is UpToDate) by {
+        let k = choose|k: int|
+            0 <= k < table@[inner].inside@.len() && #[trigger] outer_of(table@, inner, k) == outer;
+    }
+    assert forall|i: int| 0 <= i < N && own_state(facts@[i]) != Some(states@[i]) implies own_state(facts@[i])
+        == Some(State::UpToDate) && states@[i] is NeedsBump && (exists|inner: int|
+        #[trigger] ships_inside(table@, inner, i) && outgoing(table@, states@, inner)) by {
+        assert(reasons@[i] is Some);
+        let inner = reasons@[i]->Some_0 as int;
+        assert(ships_inside(table@, inner, i));
+    }
+}
+
+/// Planning the facts as they are after a bump raises no component that the
+/// bump left alone.
+proof fn lemma_a_bump_leaves_nothing_to_force(
+    layout: Seq<Component>,
+    facts: Seq<Fact>,
+    states: Seq<State>,
+    reasons: Seq<Option<usize>>,
+    after: Seq<Fact>,
+    states_after: Seq<State>,
+    reasons_after: Seq<Option<usize>>,
+    i: int,
+)
+    requires
+        0 <= i < layout.len(),
+        planned(layout, facts, states, reasons),
+        planned(layout, after, states_after, reasons_after),
+        bumps_applied(layout, facts, states, after),
+    ensures
+        own_state(after[i]) == Some(states_after[i]),
+    decreases i,
+{
+    if own_state(after[i]) != Some(states_after[i]) {
+        assert(reasons_after[i] is Some);
+        let inner = reasons_after[i]->Some_0 as int;
+        lemma_inner_first(layout, inner, i);
+        lemma_a_bump_leaves_nothing_to_force(
+            layout,
+            facts,
+            states,
+            reasons,
+            after,
+            states_after,
+            reasons_after,
+            inner,
+        );
+        if bumped(layout, states, None, inner) {
+            lemma_wanted_spreads(layout, states, None, inner, i);
+        } else {
+            assert(outgoing(layout, states, inner));
+            let k = choose|k: int|
+                0 <= k < layout[inner].inside@.len() && #[trigger] outer_of(layout, inner, k) == i;
+            assert(!(states[i] is UpToDate));
+            assert(asked(layout, states, None, i));
+        }
+    }
+}
+
+/// `after` is `facts` once every component a bump raises is ahead of its
+/// newest release.
+spec fn bumps_applied(
+    layout: Seq<Component>,
+    facts: Seq<Fact>,
+    states: Seq<State>,
+    after: Seq<Fact>,
+) -> bool {
+    forall|i: int|
+        0 <= i < layout.len() ==> own_state(#[trigger] after[i]) == (if bumped(layout, states, None, i) {
+            Some(State::Ready)
+        } else {
+            own_state(facts[i])
+        })
+}
+
+fn one_bump_leaves_nothing_to_bump_and_publish_then_accepts_everything_ready<'a, const N: usize>(
+    table: &Layout<'a, N>,
+    facts: &[Fact; N],
+    plan: &Plan<'a, N>,
+    after: &[Fact; N],
+)
+    requires
+        plan.layout() == table@,
+        planned(table@, facts@, plan.states_view(), plan.reasons()),
+        bumps_applied(table@, facts@, plan.states_view(), after@),
+{
+    let ghost layout = table@;
+    let ghost states = plan.states_view();
+    let next = match table.plan(after) {
+        Ok(next) => next,
+        Err(regressed) => {
+            assert(own_state(after@[regressed.component as int]) is None);
+            assert(false);
+            return ;
+        },
+    };
+    let ghost states_after = next.states_view();
+    assert forall|i: int| 0 <= i < N implies own_state(after@[i]) == Some(#[trigger] states_after[i]) by {
+        lemma_a_bump_leaves_nothing_to_force(
+            layout,
+            facts@,
+            states,
+            plan.reasons(),
+            after@,
+            states_after,
+            next.reasons(),
+            i,
+        );
+    }
+    assert forall|i: int| 0 <= i < N implies !asked(layout, states_after, None, i) by {
+        if asked(layout, states_after, None, i) {
+            assert(asked(layout, states, None, i));
+        }
+    }
+    let again = next.bump();
+    assert(again@.len() == 0) by {
+        if again@.len() > 0 {
+            let first = again@[0] as int;
+            assert(again@.contains(first as usize));
+            assert(bump_mask(layout, states_after, None)[first]);
+            lemma_nothing_asked_nothing_wanted(layout, states_after, None, first);
+        }
+    }
+    let published = next.publish();
+    match published {
+        Ok(order) => {
+            let released = order.as_slice();
+            assert forall|i: int| 0 <= i < N implies (released@.contains(i as usize) <==> states_after[i] is Ready) by {
+                assert(chosen_mask(states_after, None)[i] == (states_after[i] is Ready));
+            }
+        },
+        Err(super::Refusal::NotReady { component }) => {
+            assert(false);
+        },
+        Err(super::Refusal::Stranded { component, inside }) => {
+            proof {
+                let inner = component as int;
+                let outer = inside as int;
+                lemma_inner_first(layout, inner, outer);
+                if bumped(layout, states, None, inner) {
+                    lemma_wanted_spreads(layout, states, None, inner, outer);
+                } else {
+                    assert(outgoing(layout, states, inner));
+                    let k = choose|k: int|
+                        0 <= k < layout[inner].inside@.len() && #[trigger] outer_of(layout, inner, k) == outer;
+                    assert(!(states[outer] is UpToDate));
+                    assert(states[outer] is NeedsBump ==> asked(layout, states, None, outer));
+                }
+                assert(states_after[outer] is Ready);
+                assert(false);
+            }
+        },
+    }
+}
+
+fn a_named_bump_brings_everything_its_components_ship_inside<'a, const N: usize>(
+    table: &Layout<'a, N>,
+    facts: &[Fact; N],
+    names: &[usize],
+)
+    requires
+        forall|k: int| 0 <= k < names@.len() ==> #[trigger] names@[k] < N,
+{
+    let plan = match table.plan(facts) {
+        Ok(plan) => plan,
+        Err(_) => return ,
+    };
+    let states = plan.states();
+    let order = plan.bump_only(names);
+    let raised = order.as_slice();
+    let ghost named = Some(names_mask(names@, N as int));
+    assert forall|i: int|
+        0 <= i < N && named_below(names@, i, names@.len() as int) && !(states@[i] is Ready) implies raised@.contains(
+        i as usize,
+    ) by {
+        assert(asked(table@, states@, named, i));
+        assert(bump_mask(table@, states@, named)[i]);
+    }
+    assert forall|inner: int, outer: int|
+        0 <= inner < N && 0 <= outer < N && raised@.contains(inner as usize) && ships_inside(
+            table@,
+            inner,
+            outer,
+        ) implies raised@.contains(outer as usize) || states@[outer] is Ready by {
+        assert(bump_mask(table@, states@, named)[inner]);
+        lemma_wanted_spreads(table@, states@, named, inner, outer);
+        assert(bump_mask(table@, states@, named)[outer] == bumped(table@, states@, named, outer));
+    }
+    assert forall|p: int| 0 <= p < raised@.len() implies !(states@[#[trigger] raised@[p] as int] is Ready) by {
+        assert(raised@.contains(raised@[p]));
+        assert(bump_mask(table@, states@, named)[raised@[p] as int]);
+    }
+}
+
+fn publish_releases_only_what_is_ready_with_what_carries_it_and_inner_first<'a, const N: usize>(
+    table: &Layout<'a, N>,
+    facts: &[Fact; N],
+    names: Option<&[usize]>,
+)
+    requires
+        names matches Some(names) ==> forall|k: int| 0 <= k < names@.len() ==> #[trigger] names@[k] < N,
+{
+    let plan = match table.plan(facts) {
+        Ok(plan) => plan,
+        Err(_) => return ,
+    };
+    let states = plan.states();
+    let published = match names {
+        Some(names) => plan.publish_only(names),
+        None => plan.publish(),
+    };
+    let ghost named = match names {
+        Some(names) => Some(names_mask(names@, N as int)),
+        None => None,
+    };
+    if let Ok(order) = published {
+        let released = order.as_slice();
+        assert(lists(released@, chosen_mask(states@, named)));
+        assert forall|p: int| 0 <= p < released@.len() implies states@[#[trigger] released@[p] as int] is Ready by {
+            assert(released@.contains(released@[p]));
+            assert(chosen_mask(states@, named)[released@[p] as int]);
+            assert(!super::spec::not_ready(states@, named, released@[p] as int));
+        }
+        assert forall|inner: int, outer: int|
+            0 <= inner < N && released@.contains(inner as usize) && ships_inside(table@, inner, outer) implies states@[outer] is Ready
+            && (names is None ==> released@.contains(outer as usize)) by {
+            lemma_inner_first(table@, inner, outer);
+            assert(chosen_mask(states@, named)[inner]);
+            let k = choose|k: int|
+                0 <= k < table@[inner].inside@.len() && #[trigger] outer_of(table@, inner, k) == outer;
+            assert(!super::spec::stranded(table@, states@, named, inner, k));
+            if names is None {
+                assert(chosen_mask(states@, named)[outer]);
+            }
+        }
+        assert forall|p: int, q: int|
+            0 <= p < released@.len() && 0 <= q < released@.len() && ships_inside(
+                table@,
+                #[trigger] released@[p] as int,
+                #[trigger] released@[q] as int,
+            ) implies p < q by {
+            lemma_inner_first(table@, released@[p] as int, released@[q] as int);
+        }
     }
 }
 

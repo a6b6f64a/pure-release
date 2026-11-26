@@ -1,10 +1,11 @@
 [package]
 name = "pure-release"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Pure release planning decisions verified with Verus and Kani"
-repository = "https://github.com/Abrahamh08/pure-release"
+description = "Decides what to bump and publish when components ship inside one another, verified with Verus and Kani"
+repository = "https://github.com/a6b6f64a/pure-release"
+readme = "README.md"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_only)"] }
