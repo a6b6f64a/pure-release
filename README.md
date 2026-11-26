@@ -1,27 +1,45 @@
 # pure-release
 
-Some things you release never reach users on their own. A bootloader is built
-into a firmware image; a helper binary sits inside an installer. Fix the inner
-one, forget to release the outer one again, and nobody receives the fix.
+Say you fix a bug in a bootloader. You tag it, publish it, and move on. Nobody
+gets the fix, because the bootloader only ever reaches a device inside a
+firmware image and you never released the firmware again.
 
-`pure-release` keeps track of that for you. You describe which components ship
-inside which, tell it what changed, and it answers three questions:
+`pure-release` is a small Rust library that catches that. You tell it which of
+your components ship inside which others, and what has changed since the last
+release. It answers with the versions to bump, a publish order, and anything
+you should hold back.
 
-- **What needs a version bump?** Everything that changed, and everything that
-  has to be released again to carry it.
-- **What can be published, and in what order?** Inner components first.
-- **What must not be published yet?** Anything that would go out with nothing
-  on its way to carry it.
+The same slip comes in a few shapes. The outer component never gets bumped, so
+the fix sits on a shelf. Sometimes the inner one goes out while nothing is on
+its way to carry it. And if the outer one is built first, it quietly bundles
+the old copy. One rule covers all of them: a component that ships inside
+another is only released once the outer one goes out again.
 
-It decides and nothing else: no git, no builds, no uploads, no network. It is
-`no_std`, has no dependencies and does not allocate, so it drops into a
-release script, an `xtask` or a CI job. The decisions are machine-checked; see
-[what is proved](#what-is-proved).
+The library only decides. It never touches git, runs a build or uploads a
+file, so you call it from whatever release script, `xtask` or CI job you
+already have. It's `no_std`, pulls in no dependencies and doesn't allocate.
+The decisions are [machine-checked](#what-is-proved) for layouts of any size.
+
+## Is this for you?
+
+It's for projects that release bundles. Firmware with a bootloader or radio
+core baked in. An installer carrying four binaries. Apps that ship a plugin,
+or a container image wrapped around one executable. The more layers you have,
+and the more places one component ends up, the more it saves you.
+
+If your components reach users separately and only depend on each other, the
+way crates in a Cargo workspace do, reach for `cargo-release` or
+`release-plz`. Those tools also pick version numbers and publish for you.
+`pure-release` leaves both jobs to your script.
+
+Got two components? Write an `if`. This crate starts paying for itself around
+the time you add a third layer, or a part that ships in two places, because
+the rules stay the same and stay proved however the table grows.
 
 ## Example
 
-One bootloader is built into two firmware images, and a command-line tool
-ships on its own.
+One bootloader goes into two firmware images. A command-line tool ships by
+itself.
 
 ```rust
 use core::cmp::Ordering;
@@ -62,42 +80,43 @@ assert_eq!(plan.publish()?.as_slice(), [BOOTLOADER, FIRMWARE_A, FIRMWARE_B]);
 
 ## Describing your project
 
-List your components in an array. A component's position in that array is its
-name everywhere else: in the facts you pass in and in every answer you get
-back. An enum cast with `as usize`, or constants as above, keeps that readable.
+Put your components in an array. Each one's position in that array is its name
+from then on, in the facts you pass in and in every answer that comes back.
+Constants like the ones above keep that readable, and so does an enum cast
+with `as usize`.
 
-- `Component::standalone()` reaches users through its own releases.
-- `Component::ships_inside(&[A, B])` reaches users only inside releases of `A`
-  and `B`. It can ship inside as many components as you like, and those can
-  ship inside others in turn.
-- `.manual()` marks a component that is bumped only when you name it, such as
-  one you version by hand.
+A component is one of two things. `Component::standalone()` reaches users
+through its own releases. `Component::ships_inside(&[A, B])` only reaches them
+inside releases of `A` and `B`, and you can name as many outer components as
+you need. Those can ship inside others in turn.
 
-There is one rule: **list a component before everything it ships inside.**
-That is what makes a cycle impossible, and it means the publish order is simply
-the order you wrote. `Layout::new` tells you which entry breaks the rule.
-Nothing can ship inside a manual component, because the manual one could then
-stay behind.
+Add `.manual()` to a component you version by hand. It then gets bumped only
+when you name it.
+
+The table has a single ordering rule. **List a component before everything it
+ships inside.** That ordering is what rules out cycles, and it has a nice side
+effect, which is that the publish order is the order you wrote. Break the rule
+and `Layout::new` names the entry at fault. It also refuses anything that
+ships inside a manual component, since the manual one could stay behind.
 
 ## Telling it what happened
 
-Give `Layout::plan` one `Fact` per component:
+`Layout::plan` wants one `Fact` per component. Use `Fact::Unreleased` for
+something that has never gone out. For everything else use
+`Fact::Released { source, changed }`, where `source` is your source version
+compared with the newest released one (`source.cmp(&released)`) and `changed`
+says whether a release cut today would differ from that newest one.
 
-- `Fact::Unreleased` if it has never been released.
-- `Fact::Released { source, changed }` otherwise. `source` is the source
-  version compared with the newest released one (`source.cmp(&released)`).
-  `changed` says whether a release made now would differ from that newest one.
+Where those facts come from is your call. Tags, a registry, a manifest, a
+diff. One case is easy to miss: if the newest release of an outer component
+bundled an old copy of something inside it, that counts as `changed`.
 
-How you learn those is up to you: tags, a registry, a manifest, a diff. If the
-newest release of an outer component bundled an old copy of something inside
-it, count that as `changed`.
-
-A source version *below* the newest release is a mistake, and `plan` returns
-`Regressed` instead of guessing.
+A source version below the newest release is a mistake. `plan` returns
+`Regressed` and names the component.
 
 ## Reading the plan
 
-`plan.states()` holds one `State` per component:
+`plan.states()` gives you one `State` per component.
 
 | State | Meaning | What to do |
 | --- | --- | --- |
@@ -105,54 +124,54 @@ A source version *below* the newest release is a mistake, and `plan` returns
 | `NeedsBump` | Differs from its newest release, or must carry something that is going out. | Raise its version. |
 | `Ready` | Ahead of its newest release, or never released. | Publish it. |
 
-- `plan.bump()` lists what to bump. `plan.bump_only(&[..])` bumps the
-  components you name and whatever they ship inside.
-- `plan.publish()` lists what to publish, in order. `plan.publish_only(&[..])`
-  publishes the ones you name.
-- `plan.forced_by()` says, for a component that needs a bump only to carry
-  another, which one.
+`plan.bump()` lists what to bump. If you'd rather pick, `plan.bump_only(&[..])`
+bumps the components you name plus whatever they ship inside. Publishing works
+the same way: `plan.publish()` returns everything that's ready, in order, and
+`plan.publish_only(&[..])` sticks to the ones you name. When a component needs
+a bump only because it has to carry another, `plan.forced_by()` tells you
+which one.
 
-Publishing is refused, with the components involved, when a named component is
-not ahead of its release (`Refusal::NotReady`) or when a component would go out
-while something it ships inside is not being released (`Refusal::Stranded`).
+Publishing can refuse. `Refusal::NotReady` means you named a component that
+isn't ahead of its release. `Refusal::Stranded` means a component would go out
+while something it ships inside stays put. Both name the components involved.
 
 ## What is proved
 
-[Verus](https://github.com/verus-lang/verus) checks these for tables of any
-size, with any pattern of components shipping inside others:
+[Verus](https://github.com/verus-lang/verus) checks five properties for tables
+of any size, with any pattern of components shipping inside others.
 
 1. A changed component is never reported up to date, and a source below its
    release is refused.
 2. After planning, nothing heading to users ships inside a component that stays
-   as released, and a component is only made to need a bump when something
-   inside it is heading out.
-3. One bump is enough: plan again afterwards and nothing is left to bump, and
+   as released. A component is only made to need a bump when something inside
+   it is heading out.
+3. One bump is enough. Plan again afterwards and nothing is left to bump, and
    publishing then accepts everything that is ready.
 4. A named bump brings everything the named components ship inside, however
    many layers out.
-5. Publishing releases only components that are ready, never one whose outer
-   component is not being released, and always the inner one first.
+5. Publishing releases only components that are ready, always the inner one
+   first, and never one whose outer component is staying behind.
 
-[Kani](https://github.com/model-checking/kani) checks the same properties a
-second way, through the public API and without the Verus specifications, for
-every table of five components that each ship inside at most two others.
+[Kani](https://github.com/model-checking/kani) checks the same five a second
+way. Its harnesses go through the public API and ignore the Verus
+specifications, and they cover every table of five components where each ships
+inside at most two others.
 
-The proofs cover the decisions only. They do not know whether your facts are
-right, whether a change deserves a major version, or what your build and
-upload steps do.
+The proofs stop at the decisions. Feed it wrong facts and you get a
+confidently wrong plan, and nothing here knows what your build and upload
+steps do or whether a change deserves a major version.
 
-Run them with the pinned tools:
+Run them with the pinned tools.
 
 ```sh
 tools/verify-verus.sh                        # Verus 0.2026.11.02.8bf68ee on PATH
 cargo kani --lib --output-format terse       # Kani 0.68.0
 ```
 
-`tools/verify-verus.sh` rejects unproved assumptions and skipped function
-bodies.
+The Verus script fails on any unproved assumption or skipped function body.
 
 ## Origin
 
-The rules began as the release planner of
+The rules started life as the release planner in
 [Odyssey](https://github.com/odysseyarm/odyssey/blob/bfb7e416c55b73ddab9a01d31cf4c08e04247943/crates/xtask/src/release_rules.rs),
 which ships net cores and bootloaders inside application firmware.
