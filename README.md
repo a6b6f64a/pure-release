@@ -78,6 +78,13 @@ assert_eq!(plan.publish()?.as_slice(), [BOOTLOADER, FIRMWARE_A, FIRMWARE_B]);
 # }
 ```
 
+For a runnable walkthrough, try `cargo run --example installer`.
+It follows an engine change through an app into its installer, prints which
+versions need a bump and why, then shows the build and publish order after
+those bumps. Its facts are written out in
+[`examples/installer.rs`](examples/installer.rs), so you can try different
+release states without touching tags or uploading anything.
+
 ## Describing your project
 
 Put your components in an array. Each one's position in that array is its name
